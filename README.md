@@ -349,4 +349,3 @@ ORDER BY source, status;
 "
 ```
 ---
-# eu_funding_scraper
