@@ -1,0 +1,75 @@
+version: '3.8'
+
+services:
+  # PostgreSQL database
+  postgres:
+    image: postgres:15-alpine
+    container_name: eu_grants_postgres
+    environment:
+      POSTGRES_DB: ailsa
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-dev_password}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./schema.sql:/docker-entrypoint-initdb.d/schema.sql
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Scraper application with scheduler
+  scraper:
+    build: .
+    container_name: eu_grants_scraper
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      # Database
+      DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD:-dev_password}@postgres:5432/ailsa
+
+      # Pinecone
+      PINECONE_API_KEY: ${PINECONE_API_KEY}
+      PINECONE_INDEX_NAME: ${PINECONE_INDEX_NAME:-ailsa-grants}
+
+      # OpenAI
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+
+      # Scheduler settings
+      SCRAPER_SCHEDULE: ${SCRAPER_SCHEDULE:-0 */6 * * *}  # Default: Every 6 hours
+      RUN_ON_STARTUP: ${RUN_ON_STARTUP:-true}
+
+      # Scraper mode
+      SCRAPER_MODE: ${SCRAPER_MODE:-incremental}  # 'incremental' or 'full'
+      ONLY_OPEN_GRANTS: ${ONLY_OPEN_GRANTS:-true}
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+    command: python scheduler.py
+    restart: unless-stopped
+
+  # One-off scraper runner (for manual runs)
+  scraper-manual:
+    build: .
+    container_name: eu_grants_scraper_manual
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD:-dev_password}@postgres:5432/ailsa
+      PINECONE_API_KEY: ${PINECONE_API_KEY}
+      PINECONE_INDEX_NAME: ${PINECONE_INDEX_NAME:-ailsa-grants}
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      ONLY_OPEN_GRANTS: ${ONLY_OPEN_GRANTS:-true}
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+    profiles:
+      - manual
+    command: python run_incremental_update.py
+
+volumes:
+  postgres_data:
