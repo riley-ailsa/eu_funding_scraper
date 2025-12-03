@@ -19,11 +19,11 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy application code
 COPY . .
 
-# Create data directory
-RUN mkdir -p data/horizon_europe data/digital_europe logs
+# Create data and output directories
+RUN mkdir -p data/horizon_europe data/digital_europe outputs/logs outputs/excel
 
 # Set environment variables
 ENV PYTHONUNBUFFERED=1
 
 # Default command (can be overridden)
-CMD ["python", "run_incremental_update.py"]
+CMD ["python", "run_pipeline.py"]

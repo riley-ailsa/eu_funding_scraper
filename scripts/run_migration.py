@@ -11,8 +11,11 @@ from dotenv import load_dotenv
 load_dotenv()
 DATABASE_URL = os.getenv("DATABASE_URL")
 
-# Read migration SQL
-with open('migrations/001_add_enhanced_fields.sql', 'r') as f:
+# Read migration SQL (path relative to project root)
+from pathlib import Path
+project_root = Path(__file__).parent.parent
+migration_file = project_root / 'migrations' / '001_add_enhanced_fields.sql'
+with open(migration_file, 'r') as f:
     migration_sql = f.read()
 
 # Connect and run migration
@@ -45,4 +48,4 @@ finally:
     cursor.close()
     conn.close()
 
-print("\n✅ Ready to run: python3 ingest_to_production.py")
+print("\n✅ Ready to run: python3 run_pipeline.py")

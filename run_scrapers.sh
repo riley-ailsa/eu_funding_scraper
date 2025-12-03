@@ -6,7 +6,7 @@ SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 cd "$SCRIPT_DIR"
 
 # Setup logging
-LOG_DIR="$SCRIPT_DIR/logs"
+LOG_DIR="$SCRIPT_DIR/outputs/logs"
 mkdir -p "$LOG_DIR"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 
@@ -39,7 +39,7 @@ if [ $HORIZON_EXIT -ne 0 ] || [ $DIGITAL_EXIT -ne 0 ]; then
 fi
 
 # Optional: Run validation
-python validate_run.py all >> "$LOG_DIR/validation_$TIMESTAMP.log" 2>&1
+python scripts/validate_run.py all >> "$LOG_DIR/validation_$TIMESTAMP.log" 2>&1
 
 echo "========================================" >> "$LOG_DIR/cron.log"
 echo "" >> "$LOG_DIR/cron.log"

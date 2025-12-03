@@ -17,7 +17,7 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('logs/scheduler.log'),
+        logging.FileHandler('outputs/logs/scheduler.log'),
         logging.StreamHandler(sys.stdout)
     ]
 )
@@ -34,7 +34,7 @@ def run_scraper():
     try:
         # Run the incremental update script
         result = subprocess.run(
-            [sys.executable, 'run_incremental_update.py'],
+            [sys.executable, 'scripts/run_incremental_update.py'],
             capture_output=True,
             text=True,
             timeout=3600  # 1 hour timeout

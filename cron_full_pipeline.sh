@@ -8,7 +8,7 @@ SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 cd "$SCRIPT_DIR"
 
 # Setup logging
-LOG_DIR="$SCRIPT_DIR/logs"
+LOG_DIR="$SCRIPT_DIR/outputs/logs"
 mkdir -p "$LOG_DIR"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 LOGFILE="$LOG_DIR/pipeline_$TIMESTAMP.log"
@@ -47,9 +47,9 @@ else
     log "❌ Digital Europe scraping failed (exit code: $DIGITAL_EXIT)"
 fi
 
-# Step 3: Ingest to Production (PostgreSQL + Pinecone)
+# Step 3: Ingest to Production (MongoDB + Pinecone)
 log "💾 Step 3/4: Ingesting to production database..."
-python3 ingest_to_production.py >> "$LOGFILE" 2>&1
+python3 run_pipeline.py >> "$LOGFILE" 2>&1
 INGEST_EXIT=$?
 
 if [ $INGEST_EXIT -eq 0 ]; then

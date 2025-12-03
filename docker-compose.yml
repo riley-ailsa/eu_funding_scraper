@@ -1,21 +1,21 @@
 version: '3.8'
 
 services:
-  # PostgreSQL database
-  postgres:
-    image: postgres:15-alpine
-    container_name: eu_grants_postgres
+  # MongoDB database
+  mongodb:
+    image: mongo:7
+    container_name: eu_grants_mongodb
     environment:
-      POSTGRES_DB: ailsa
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-dev_password}
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_USER:-admin}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_PASSWORD:-dev_password}
+      MONGO_INITDB_DATABASE: ailsa_grants
     volumes:
-      - postgres_data:/var/lib/postgresql/data
-      - ./schema.sql:/docker-entrypoint-initdb.d/schema.sql
+      - mongo_data:/data/db
+      - ./config/mongo_setup.js:/docker-entrypoint-initdb.d/mongo_setup.js:ro
     ports:
-      - "5432:5432"
+      - "27017:27017"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -25,11 +25,12 @@ services:
     build: .
     container_name: eu_grants_scraper
     depends_on:
-      postgres:
+      mongodb:
         condition: service_healthy
     environment:
-      # Database
-      DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD:-dev_password}@postgres:5432/ailsa
+      # MongoDB
+      MONGO_URI: mongodb://${MONGO_USER:-admin}:${MONGO_PASSWORD:-dev_password}@mongodb:27017/ailsa_grants?authSource=admin
+      MONGO_DB_NAME: ${MONGO_DB_NAME:-ailsa_grants}
 
       # Pinecone
       PINECONE_API_KEY: ${PINECONE_API_KEY}
@@ -47,7 +48,7 @@ services:
       ONLY_OPEN_GRANTS: ${ONLY_OPEN_GRANTS:-true}
     volumes:
       - ./data:/app/data
-      - ./logs:/app/logs
+      - ./outputs:/app/outputs
     command: python scheduler.py
     restart: unless-stopped
 
@@ -56,20 +57,21 @@ services:
     build: .
     container_name: eu_grants_scraper_manual
     depends_on:
-      postgres:
+      mongodb:
         condition: service_healthy
     environment:
-      DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD:-dev_password}@postgres:5432/ailsa
+      MONGO_URI: mongodb://${MONGO_USER:-admin}:${MONGO_PASSWORD:-dev_password}@mongodb:27017/ailsa_grants?authSource=admin
+      MONGO_DB_NAME: ${MONGO_DB_NAME:-ailsa_grants}
       PINECONE_API_KEY: ${PINECONE_API_KEY}
       PINECONE_INDEX_NAME: ${PINECONE_INDEX_NAME:-ailsa-grants}
       OPENAI_API_KEY: ${OPENAI_API_KEY}
       ONLY_OPEN_GRANTS: ${ONLY_OPEN_GRANTS:-true}
     volumes:
       - ./data:/app/data
-      - ./logs:/app/logs
+      - ./outputs:/app/outputs
     profiles:
       - manual
-    command: python run_incremental_update.py
+    command: python run_pipeline.py
 
 volumes:
-  postgres_data:
+  mongo_data:

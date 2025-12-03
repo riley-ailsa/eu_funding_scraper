@@ -26,6 +26,7 @@ class NormalizedGrant:
     call_id: Optional[str] = None
     open_date: Optional[str] = None
     close_date: Optional[str] = None
+    deadline_dates: Optional[List[str]] = None  # All cutoff dates for multiple-deadline grants
     raw: Dict[str, Any] = None
 
     def __post_init__(self):

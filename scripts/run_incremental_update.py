@@ -5,9 +5,14 @@ Perfect for scheduled cron jobs.
 """
 
 import os
+import sys
 import json
 from pathlib import Path
 from datetime import datetime, timezone
+
+# Add project root to path
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
 from scraper.pipelines import horizon_europe, digital_europe
 
 # Check if we should use open-only mode

@@ -19,8 +19,8 @@ from collections import Counter, defaultdict
 from datetime import datetime
 import re
 
-# Add scraper to path
-sys.path.insert(0, str(Path(__file__).parent))
+# Add project root to path
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
 
 def load_json(filepath: Path):

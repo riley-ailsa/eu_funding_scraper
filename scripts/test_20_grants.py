@@ -12,8 +12,8 @@ import json
 from pathlib import Path
 from collections import Counter
 
-# Add scraper to path
-sys.path.insert(0, str(Path(__file__).parent))
+# Add project root to path
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from scraper.pipelines import horizon_europe, digital_europe
 

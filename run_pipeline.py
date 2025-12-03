@@ -349,8 +349,11 @@ def normalize_eu_grant(grant: Dict[str, Any], source: str) -> Dict[str, Any]:
             if close_dt < open_dt:
                 logger.warning(f"Fixing swapped dates for {grant['id']}")
                 open_date, close_date = close_date, open_date
-        except (ValueError, TypeError):
-            pass
+                open_dt, close_dt = close_dt, open_dt
+        except (ValueError, TypeError) as e:
+            logger.warning(f"Invalid dates for {grant['id']}: {e}")
+            open_date = None
+            close_date = None
 
     # Extract fields
     budget_min, budget_max = extract_budget(grant)
@@ -377,6 +380,7 @@ def normalize_eu_grant(grant: Dict[str, Any], source: str) -> Dict[str, Any]:
         "opens_at": open_date,
         "closes_at": close_date,
         "deadline_model": extract_deadline_model(grant),
+        "deadline_dates": grant.get('deadline_dates'),  # All cutoff dates for multiple-deadline grants
 
         # Funding (EUR values, with GBP conversion)
         "total_fund_gbp": convert_eur_to_gbp(budget_max),

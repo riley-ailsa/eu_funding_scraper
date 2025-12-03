@@ -291,14 +291,24 @@ class EUFundingTendersPipeline(FundingBodyPipeline):
         # Extract dates - metadata fields are usually arrays
         open_date = None
         close_date = None
+        deadline_dates = []  # Store all deadlines for multiple cut-off grants
 
         # Try deadlineDate first (common field, usually an array)
         deadline_date_field = metadata.get("deadlineDate")
         if deadline_date_field:
             if isinstance(deadline_date_field, list) and len(deadline_date_field) > 0:
-                close_date = self._parse_date(deadline_date_field[0])
+                # Extract ALL deadlines for multiple cutoff grants
+                deadline_dates = [
+                    self._parse_date(d)
+                    for d in deadline_date_field
+                    if self._parse_date(d) is not None
+                ]
+                # Use first deadline as primary close_date (for sorting)
+                close_date = deadline_dates[0] if deadline_dates else None
             else:
                 close_date = self._parse_date(deadline_date_field)
+                if close_date:
+                    deadline_dates = [close_date]
 
         # Try opening date
         opening_date_field = metadata.get("openingDate") or metadata.get("startDate")
@@ -312,18 +322,34 @@ class EUFundingTendersPipeline(FundingBodyPipeline):
         if not close_date or not open_date:
             deadlines = metadata.get("deadlines", [])
             if deadlines and isinstance(deadlines, list) and len(deadlines) > 0:
-                first_deadline = deadlines[0]
-                if isinstance(first_deadline, dict):
-                    if not open_date:
-                        open_date = self._parse_date(first_deadline.get("startDate"))
-                    if not close_date:
-                        close_date = self._parse_date(first_deadline.get("date"))
+                # Extract all deadline dates from array
+                for deadline in deadlines:
+                    if isinstance(deadline, dict):
+                        if not open_date:
+                            open_date = self._parse_date(deadline.get("startDate"))
+                        deadline_date = self._parse_date(deadline.get("date"))
+                        if deadline_date and deadline_date not in deadline_dates:
+                            deadline_dates.append(deadline_date)
 
-        # Generate URL
-        url = TOPIC_URL_TEMPLATE.format(call_id=grant_id)
+                # Set close_date to first deadline if not already set
+                if not close_date and deadline_dates:
+                    close_date = deadline_dates[0]
+
+        # Generate URL using identifier (topic code), not reference
+        # The identifier is the official topic code like "HORIZON-CL5-2024-D2-01"
+        identifier_field = metadata.get("identifier")
+        if identifier_field:
+            if isinstance(identifier_field, list) and len(identifier_field) > 0:
+                topic_identifier = identifier_field[0]
+            else:
+                topic_identifier = identifier_field
+            url = TOPIC_URL_TEMPLATE.format(call_id=topic_identifier)
+        else:
+            # Fallback to grant_id (reference) if no identifier
+            url = TOPIC_URL_TEMPLATE.format(call_id=grant_id)
 
         return NormalizedGrant(
-            id=f"{self.source_name}:{grant_id}",
+            id=f"{self.source_name}:{grant_id}",  # Keep reference as internal ID
             source=self.source_name,
             title=title,
             url=url,
@@ -332,6 +358,7 @@ class EUFundingTendersPipeline(FundingBodyPipeline):
             call_id=grant_id,
             open_date=open_date,
             close_date=close_date,
+            deadline_dates=deadline_dates if len(deadline_dates) > 1 else None,
             raw=index_record,
         )
 
