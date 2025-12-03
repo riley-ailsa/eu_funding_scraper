@@ -8,7 +8,7 @@ This guide covers deploying the EU Funding Scraper using Docker with automated s
 - **Open Grants Only**: Option to scrape only open grants
 - **Change Detection**: Tracks what changed (new, updated, deleted grants)
 - **Detailed Reports**: JSON reports with specific field changes
-- **PostgreSQL Integration**: Stores data in PostgreSQL
+- **MongoDB Integration**: Stores data in MongoDB (local or Atlas)
 - **Pinecone Integration**: Syncs to vector database
 - **Checkpoint Recovery**: Resumes from last successful state
 
@@ -19,15 +19,16 @@ This guide covers deploying the EU Funding Scraper using Docker with automated s
 Create a `.env` file with your credentials:
 
 ```bash
+# Required: MongoDB
+MONGO_URI=mongodb+srv://user:password@cluster.mongodb.net/
+MONGO_DB_NAME=ailsa_grants
+
 # Required: Pinecone
 PINECONE_API_KEY=your_pinecone_api_key
 PINECONE_INDEX_NAME=ailsa-grants
 
 # Required: OpenAI
 OPENAI_API_KEY=your_openai_api_key
-
-# Optional: PostgreSQL password (defaults to 'dev_password')
-POSTGRES_PASSWORD=your_secure_password
 
 # Optional: Scheduler configuration
 SCRAPER_SCHEDULE=0 */6 * * *  # Every 6 hours
@@ -38,7 +39,7 @@ ONLY_OPEN_GRANTS=true  # Set to 'false' to scrape all statuses
 ### 2. Start Services
 
 ```bash
-# Start all services (PostgreSQL + Scraper with scheduler)
+# Start scraper service
 docker-compose up -d
 
 # View logs
@@ -69,11 +70,12 @@ docker-compose run --rm scraper-manual python -c "from scraper.pipelines.horizon
 
 | Variable | Description | Default |
 |----------|-------------|---------|
+| `MONGO_URI` | MongoDB connection string | Required |
+| `MONGO_DB_NAME` | MongoDB database name | `ailsa_grants` |
 | `SCRAPER_SCHEDULE` | Cron expression for schedule | `0 */6 * * *` (every 6 hours) |
 | `RUN_ON_STARTUP` | Run scraper immediately on startup | `true` |
 | `ONLY_OPEN_GRANTS` | Only scrape open grants | `true` |
 | `SCRAPER_MODE` | Mode: `incremental` or `full` | `incremental` |
-| `DATABASE_URL` | PostgreSQL connection string | Auto-configured |
 | `PINECONE_API_KEY` | Pinecone API key | Required |
 | `PINECONE_INDEX_NAME` | Pinecone index name | `ailsa-grants` |
 | `OPENAI_API_KEY` | OpenAI API key | Required |
@@ -97,11 +99,75 @@ SCRAPER_SCHEDULE=0 9 * * 1
 SCRAPER_SCHEDULE=0 9-17/4 * * *
 ```
 
+## MongoDB Setup
+
+### Option 1: MongoDB Atlas (Recommended for Production)
+
+1. Create a free cluster at [MongoDB Atlas](https://www.mongodb.com/atlas)
+2. Create a database user with read/write permissions
+3. Whitelist your IP address (or allow all IPs for Docker)
+4. Get your connection string and add it to `.env`:
+
+```bash
+MONGO_URI=mongodb+srv://username:password@cluster.mongodb.net/
+```
+
+### Option 2: Local MongoDB with Docker
+
+Add MongoDB to your docker-compose.yml:
+
+```yaml
+services:
+  mongodb:
+    image: mongo:7
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongodb_data:/data/db
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: admin
+      MONGO_INITDB_ROOT_PASSWORD: your_password
+
+  scraper:
+    # ... your scraper config
+    depends_on:
+      - mongodb
+    environment:
+      MONGO_URI: mongodb://admin:your_password@mongodb:27017/
+
+volumes:
+  mongodb_data:
+```
+
+### Creating Indexes
+
+For optimal query performance, create indexes on common query fields:
+
+```javascript
+// Connect to MongoDB
+mongosh "$MONGO_URI"
+
+// Switch to database
+use ailsa_grants
+
+// Create indexes
+db.grants.createIndex({ "grant_id": 1 }, { unique: true })
+db.grants.createIndex({ "source": 1 })
+db.grants.createIndex({ "status": 1 })
+db.grants.createIndex({ "is_active": 1 })
+db.grants.createIndex({ "closes_at": 1 })
+db.grants.createIndex({ "programme": 1 })
+db.grants.createIndex({ "tags": 1 })
+db.grants.createIndex({ "sectors": 1 })
+db.grants.createIndex({ "source": 1, "status": 1 })
+db.grants.createIndex({ "title": "text", "description": "text" })
+```
+
 ## Data Persistence
 
 ### Volumes
 
-- `postgres_data`: PostgreSQL database files
+- `mongodb_data`: MongoDB database files (if running locally)
 - `./data`: Scraped grant data and reports
 - `./logs`: Application logs
 
@@ -188,11 +254,30 @@ ls -lh data/*/update_report_*.json
 # Check if services are running
 docker-compose ps
 
-# Check PostgreSQL
-docker-compose exec postgres psql -U postgres ailsa -c "SELECT COUNT(*) FROM grants;"
+# Check MongoDB connection
+mongosh "$MONGO_URI" --eval 'db.grants.countDocuments({})'
 
-# Test database connection
+# Test database connection from container
 docker-compose exec scraper python test_connections.py
+```
+
+### Database Statistics
+
+```bash
+# Get grant counts by source and status
+mongosh "$MONGO_URI" --eval '
+use ailsa_grants;
+db.grants.aggregate([
+  {$group: {_id: {source: "$source", status: "$status"}, count: {$sum: 1}}},
+  {$sort: {"_id.source": 1, "_id.status": 1}}
+])
+'
+
+# Get open grants
+mongosh "$MONGO_URI" --eval '
+use ailsa_grants;
+db.grants.find({is_active: true}, {title: 1, closes_at: 1}).sort({closes_at: 1}).limit(10)
+'
 ```
 
 ## Troubleshooting
@@ -210,15 +295,17 @@ docker-compose restart scraper
 docker-compose up -d --build scraper
 ```
 
-### Database Issues
+### MongoDB Connection Issues
 
 ```bash
-# Connect to PostgreSQL
-docker-compose exec postgres psql -U postgres ailsa
+# Test connection string
+mongosh "$MONGO_URI" --eval 'db.runCommand({ping: 1})'
 
-# Reset database (WARNING: deletes all data)
-docker-compose down -v
-docker-compose up -d
+# Check if URI is correctly formatted
+# Should be: mongodb+srv://user:pass@cluster.mongodb.net/
+
+# For Atlas: ensure IP is whitelisted
+# For local: ensure MongoDB is running
 ```
 
 ### Reset Checkpoints
@@ -233,29 +320,30 @@ docker-compose restart scraper
 
 ### Security Recommendations
 
-1. **Use strong passwords**: Set `POSTGRES_PASSWORD` to a strong random value
-2. **Secure .env file**: Never commit `.env` to version control
+1. **Use MongoDB Atlas**: Managed service with built-in security
+2. **Secure connection strings**: Use environment variables, never commit credentials
 3. **Network isolation**: Use Docker networks to isolate services
-4. **Regular backups**: Backup `postgres_data` volume and `data/` directory
+4. **Enable authentication**: Always use authenticated connections
+5. **Regular backups**: Enable automated backups in Atlas or run manual backups
 
 ### Backup Strategy
 
 ```bash
-# Backup PostgreSQL
-docker-compose exec postgres pg_dump -U postgres ailsa > backup_$(date +%Y%m%d).sql
+# Export grants collection
+mongodump --uri="$MONGO_URI" --db=ailsa_grants --collection=grants --out=./backup_$(date +%Y%m%d)
 
 # Backup data directory
 tar -czf data_backup_$(date +%Y%m%d).tar.gz data/
 
-# Restore PostgreSQL
-docker-compose exec -T postgres psql -U postgres ailsa < backup_20251120.sql
+# Restore from backup
+mongorestore --uri="$MONGO_URI" --db=ailsa_grants ./backup_20251120/ailsa_grants/
 ```
 
 ### Scaling Considerations
 
 - **CPU**: Scraper is I/O bound (API calls), 1-2 CPUs sufficient
 - **Memory**: 512MB-1GB RAM per scraper instance
-- **Storage**: ~1GB for database, ~500MB for data files
+- **Storage**: ~100MB for MongoDB (grows with data), ~500MB for data files
 - **Network**: ~10-50 MB per scrape run
 
 ## Advanced Usage
@@ -287,6 +375,41 @@ Run it:
 
 ```bash
 docker-compose run --rm scraper python custom_scrape.py
+```
+
+### Query Examples
+
+```javascript
+// Find all open grants closing in the next 30 days
+db.grants.find({
+  is_active: true,
+  closes_at: {
+    $gte: new Date(),
+    $lte: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000)
+  }
+}).sort({closes_at: 1})
+
+// Find grants by programme
+db.grants.find({
+  programme: "HORIZON-CL5"
+})
+
+// Find grants with specific tags
+db.grants.find({
+  tags: {$in: ["Climate", "Digital"]}
+})
+
+// Full-text search
+db.grants.find({
+  $text: {$search: "artificial intelligence"}
+})
+
+// Aggregation: count by programme
+db.grants.aggregate([
+  {$match: {is_active: true}},
+  {$group: {_id: "$programme", count: {$sum: 1}}},
+  {$sort: {count: -1}}
+])
 ```
 
 ## Support

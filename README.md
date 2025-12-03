@@ -4,7 +4,7 @@
 
 [![Status](https://img.shields.io/badge/status-production-brightgreen)]()
 [![Python](https://img.shields.io/badge/python-3.9+-blue)]()
-[![Database](https://img.shields.io/badge/database-PostgreSQL-316192)]()
+[![Database](https://img.shields.io/badge/database-MongoDB-47A248)]()
 [![Vector DB](https://img.shields.io/badge/vector-Pinecone-orange)]()
 
 ---
@@ -16,7 +16,7 @@ This system provides end-to-end automation for EU grant discovery:
 1. **Scrapes** grant data from EU Funding & Tenders Portal
 2. **Extracts** 15+ metadata fields from raw API responses
 3. **Validates** dates, maps status codes, cleans HTML
-4. **Stores** structured data in PostgreSQL
+4. **Stores** structured data in MongoDB
 5. **Embeds** full grant descriptions for semantic search in Pinecone
 6. **Schedules** automated updates via cron
 
@@ -29,7 +29,7 @@ This system provides end-to-end automation for EU grant discovery:
 ### Prerequisites
 
 - Python 3.9+
-- PostgreSQL 13+
+- MongoDB 6.0+ (local or Atlas)
 - Pinecone account
 - OpenAI API key
 
@@ -45,24 +45,18 @@ pip install -r requirements.txt
 
 # 3. Configure environment
 cp .env.example .env
-# Edit .env with your API keys and database URL
+# Edit .env with your API keys and MongoDB URI
 ```
 
 ### First Run
 
 ```bash
-# 1. Setup database schema
-psql $DATABASE_URL -f schema.sql
-
-# 2. Apply migrations for enhanced fields
-python3 run_migration.py
-
-# 3. Run complete pipeline
+# 1. Run complete pipeline
 python3 -m scraper.pipelines.horizon_europe    # Scrape Horizon Europe
 python3 -m scraper.pipelines.digital_europe    # Scrape Digital Europe
-python3 ingest_to_production.py                # Ingest to databases
+python3 ingest_to_production.py                # Ingest to MongoDB + Pinecone
 
-# 4. Verify results
+# 2. Verify results
 python3 validate_run.py
 ```
 
@@ -70,23 +64,77 @@ python3 validate_run.py
 
 ## Data Schema
 
-### Extracted Fields (per grant)
+### MongoDB Document Schema
+
+```python
+{
+    "grant_id": "horizon_europe_XXXX",  # Unique identifier
+    "source": "horizon_europe",          # horizon_europe or digital_europe
+    "external_id": "HORIZON-CL5-...",   # Official EU identifier
+
+    # Core metadata
+    "title": "Grant title",
+    "call_title": "Full call name",
+    "url": "https://...",
+    "description": "Full description text",
+    "description_summary": "First 500 chars",
+
+    # Status & dates
+    "status": "Open",                    # Open/Closed/Forthcoming
+    "is_active": true,
+    "opens_at": "2025-01-01T00:00:00Z",
+    "closes_at": "2025-06-30T17:00:00Z",
+    "deadline_model": "single-stage",
+
+    # Funding (EUR with GBP conversion)
+    "total_fund_gbp": 850000,
+    "total_fund_eur": 1000000,
+    "budget_min": 1000000,
+    "budget_max": 1000000,
+    "project_funding_min": 1000000,
+    "project_funding_max": 1000000,
+    "competition_type": "grant",
+
+    # Programme info
+    "programme": "HORIZON-CL5",
+    "action_type": "HORIZON-RIA",
+    "duration": "36 months",
+
+    # Classification
+    "tags": ["Climate", "Digital"],
+    "sectors": ["Climate", "Environment"],
+
+    # Additional EU-specific fields
+    "further_information": "...",
+    "application_info": "...",
+
+    # Timestamps
+    "scraped_at": ISODate("..."),
+    "updated_at": ISODate("..."),
+    "created_at": ISODate("...")
+}
+```
+
+### Field Coverage
 
 | Field | Type | Coverage | Description |
 |-------|------|----------|-------------|
 | `grant_id` | string | 100% | Unique identifier |
 | `source` | string | 100% | horizon_europe or digital_europe |
 | `title` | text | 100% | Grant title |
-| `eu_identifier` | string | 100% | Official EU ID (e.g., HORIZON-CL5-...) |
+| `external_id` | string | 100% | Official EU ID (e.g., HORIZON-CL5-...) |
 | `programme` | string | 100% | Programme code (HORIZON-CL5, HORIZON-EIT, etc.) |
 | `status` | string | 100% | Open / Closed / Forthcoming |
-| `open_date` | date | High | Application opening date |
-| `close_date` | date | High | Deadline |
+| `is_active` | boolean | 100% | True if status is Open |
+| `opens_at` | datetime | High | Application opening date |
+| `closes_at` | datetime | High | Deadline |
 | `deadline_model` | string | 99% | single-stage or multiple cut-off |
-| `budget_min` | bigint | 17% | Minimum budget (EUR) |
-| `budget_max` | bigint | 17% | Maximum budget (EUR) |
+| `budget_min` | integer | 17% | Minimum budget (EUR) |
+| `budget_max` | integer | 17% | Maximum budget (EUR) |
+| `total_fund_gbp` | integer | 17% | Budget converted to GBP |
 | `duration` | string | 13% | Project duration |
-| `tags` | text[] | 64% | Cross-cutting priorities/themes |
+| `tags` | array | 64% | Cross-cutting priorities/themes |
+| `sectors` | array | 100% | Derived sector categories |
 | `action_type` | string | 100% | Grant type classification |
 | `description_summary` | text | High | First 500 chars |
 | `call_title` | text | 100% | Full call name |
@@ -98,13 +146,13 @@ python3 validate_run.py
 
 ```
 ┌─────────────────────┐       ┌──────────────────────┐
-│   PostgreSQL        │       │      Pinecone        │
-│  (Structured Data)  │       │  (Vector Embeddings) │
+│      MongoDB        │       │      Pinecone        │
+│  (Document Store)   │       │  (Vector Embeddings) │
 ├─────────────────────┤       ├──────────────────────┤
-│ • Metadata fields   │       │ • Full descriptions  │
-│ • SQL filtering     │       │ • Semantic search    │
-│ • Analytics         │       │ • Similarity ranking │
-│ • User tracking     │       │ • Filterable metadata│
+│ • Full documents    │       │ • Full descriptions  │
+│ • Flexible schema   │       │ • Semantic search    │
+│ • Rich queries      │       │ • Similarity ranking │
+│ • Aggregations      │       │ • Filterable metadata│
 └─────────────────────┘       └──────────────────────┘
 ```
 
@@ -124,15 +172,15 @@ chmod +x cron_full_pipeline.sh
 crontab -e
 
 # Add this line (runs daily at 2 AM)
-0 2 * * * /Users/rileycoleman/EU\ Funding\ Scraper/cron_full_pipeline.sh
+0 2 * * * /path/to/EU\ Funding\ Scraper/cron_full_pipeline.sh
 
 # Or for weekly updates (Sundays at 2 AM)
-0 2 * * 0 /Users/rileycoleman/EU\ Funding\ Scraper/cron_full_pipeline.sh
+0 2 * * 0 /path/to/EU\ Funding\ Scraper/cron_full_pipeline.sh
 ```
 
 The pipeline script:
 - Scrapes both funding sources
-- Ingests to PostgreSQL + Pinecone
+- Ingests to MongoDB + Pinecone
 - Logs all operations
 - Sends alerts on failure (if configured)
 - Cleans up old logs
@@ -144,12 +192,9 @@ The pipeline script:
 ```
 EU Funding Scraper/
 ├── README.md                      # This file
-├── .env                           # Configuration (API keys, DB URL)
+├── DEPLOYMENT.md                  # Docker deployment guide
+├── .env                           # Configuration (API keys, MongoDB URI)
 ├── requirements.txt               # Python dependencies
-│
-├── schema.sql                     # PostgreSQL schema
-├── migrations/                    # Database migrations
-│   └── 001_add_enhanced_fields.sql
 │
 ├── scraper/                       # Scraping engine
 │   ├── base.py                    # Base pipeline with checkpointing
@@ -158,8 +203,7 @@ EU Funding Scraper/
 │       ├── horizon_europe.py      # Horizon Europe scraper
 │       └── digital_europe.py      # Digital Europe scraper
 │
-├── ingest_to_production.py        # Main ingestion script
-├── run_migration.py               # Database migration runner
+├── ingest_to_production.py        # Main ingestion script (MongoDB + Pinecone)
 ├── validate_run.py                # Data validation
 │
 ├── cron_full_pipeline.sh          # Automated pipeline (scrape + ingest)
@@ -205,7 +249,7 @@ EU Funding Scraper/
 ### 3. Semantic Search
 - **Full-Text Embeddings**: Entire grant descriptions (up to 4,000 chars)
 - **OpenAI Embeddings**: text-embedding-3-small model
-- **Rich Metadata**: 15+ filterable fields in Pinecone
+- **Rich Metadata**: 10+ filterable fields in Pinecone
 - **Hybrid Search**: Combine vector similarity with metadata filters
 
 ### 4. Production Ready
@@ -250,15 +294,16 @@ python3 validate_run.py all
 ### Environment Variables (.env)
 
 ```bash
+# MongoDB
+MONGO_URI=mongodb+srv://user:pass@cluster.mongodb.net/
+MONGO_DB_NAME=ailsa_grants
+
 # Pinecone
 PINECONE_API_KEY=pcsk_...
 PINECONE_INDEX_NAME=ailsa-grants
 
 # OpenAI
 OPENAI_API_KEY=sk-proj-...
-
-# PostgreSQL
-DATABASE_URL=postgresql://user:pass@host:5432/dbname
 ```
 
 ### Status Filters
@@ -274,6 +319,7 @@ To fetch **all** grants including archived, modify status filters in pipeline fi
 
 ## Documentation
 
+- [Deployment Guide](DEPLOYMENT.md) - Docker deployment instructions
 - [Extraction Summary](docs/EXTRACTION_SUMMARY.md) - Detailed field extraction
 - [Cron Setup Guide](docs/CRON_SETUP.md) - Scheduling instructions
 - [Data Quality Notes](docs/DUPLICATE_IDS_EXPLAINED.md) - Known issues
@@ -295,13 +341,18 @@ rm data/horizon_europe/checkpoint.json
 python3 -m scraper.pipelines.horizon_europe
 ```
 
-### Database Issues
+### MongoDB Issues
 ```bash
 # Test connection
-psql $DATABASE_URL -c "SELECT COUNT(*) FROM grants;"
+mongosh "$MONGO_URI" --eval 'db.grants.countDocuments({})'
 
-# Re-run migrations
-python3 run_migration.py
+# Check counts by source
+mongosh "$MONGO_URI" --eval '
+use ailsa_grants;
+db.grants.aggregate([
+  {$group: {_id: "$source", count: {$sum: 1}}}
+])
+'
 ```
 
 ### Ingestion Issues
@@ -315,8 +366,30 @@ from ingest_to_production import *
 import json
 with open('data/horizon_europe/normalized.json') as f:
     grants = json.load(f)
-print(ingest_grant(grants[0]))
+print(ingest_grant(grants[0], 'horizon_europe'))
 "
+```
+
+---
+
+## Verification Commands
+
+```bash
+# Run scrapers
+python3 -m scraper.pipelines.horizon_europe
+python3 -m scraper.pipelines.digital_europe
+
+# Ingest to MongoDB
+python3 ingest_to_production.py
+
+# Verify counts
+mongosh "$MONGO_URI" --eval '
+use ailsa_grants;
+print("Horizon Europe:", db.grants.countDocuments({source: "horizon_europe"}));
+print("Digital Europe:", db.grants.countDocuments({source: "digital_europe"}));
+print("Open grants:", db.grants.countDocuments({status: "Open"}));
+print("Total:", db.grants.countDocuments({}));
+'
 ```
 
 ---
@@ -325,8 +398,7 @@ print(ingest_grant(grants[0]))
 
 ### Production Checklist
 - [ ] Environment variables configured
-- [ ] Database schema applied
-- [ ] Migrations run
+- [ ] MongoDB connection verified
 - [ ] Test run successful
 - [ ] Cron job scheduled
 - [ ] Monitoring/alerts configured
@@ -341,11 +413,11 @@ cat logs/last_run_status
 ls -lth logs/ | head -10
 
 # Check database counts
-psql $DATABASE_URL -c "
-SELECT source, status, COUNT(*)
-FROM grants
-GROUP BY source, status
-ORDER BY source, status;
-"
+mongosh "$MONGO_URI" --eval '
+use ailsa_grants;
+db.grants.aggregate([
+  {$group: {_id: {source: "$source", status: "$status"}, count: {$sum: 1}}},
+  {$sort: {"_id.source": 1, "_id.status": 1}}
+])
+'
 ```
----

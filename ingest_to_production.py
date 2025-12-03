@@ -1,18 +1,19 @@
 #!/usr/bin/env python3
 """
-Ingest EU grants into production PostgreSQL + Pinecone.
-This replaces your standalone embed_grants.py
+Ingest EU grants into production MongoDB + Pinecone.
+Handles both Horizon Europe and Digital Europe programmes.
 """
 
 import json
 import os
 import re
+import logging
 from pathlib import Path
-from datetime import datetime
-from typing import Dict, Any, List
+from datetime import datetime, timezone
+from typing import Dict, Any, List, Optional
 
-import psycopg2
 import openai
+from pymongo import MongoClient
 from pinecone import Pinecone
 from tqdm import tqdm
 from dotenv import load_dotenv
@@ -20,36 +21,47 @@ from dotenv import load_dotenv
 # Load environment
 load_dotenv()
 
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
 # Configuration
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
 PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX_NAME", "ailsa-grants")
-DATABASE_URL = os.getenv("DATABASE_URL")
+MONGO_URI = os.getenv("MONGO_URI")
+MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "ailsa_grants")
 
-openai.api_key = OPENAI_API_KEY
+# EUR to GBP exchange rate (update periodically or use API)
+EUR_TO_GBP_RATE = 0.85
 
 # Initialize clients
+openai.api_key = OPENAI_API_KEY
 pc = Pinecone(api_key=PINECONE_API_KEY)
 index = pc.Index(PINECONE_INDEX_NAME)
-pg_conn = psycopg2.connect(DATABASE_URL)
+mongo_client = MongoClient(MONGO_URI)
+db = mongo_client[MONGO_DB_NAME]
 
 
 def load_grants(source: str) -> List[Dict[str, Any]]:
-    """Load normalized grants from scraper output"""
+    """Load normalized grants from scraper output."""
     file_path = Path(f"data/{source}/normalized.json")
-    
+
     if not file_path.exists():
-        print(f"❌ File not found: {file_path}")
-        print(f"   Run scraper first: python -m scraper.pipelines.{source}")
+        logger.error(f"File not found: {file_path}")
+        logger.info(f"Run scraper first: python -m scraper.pipelines.{source}")
         return []
-    
+
     grants = json.loads(file_path.read_text(encoding='utf-8'))
-    print(f"📁 Loaded {len(grants)} grants from {source}")
+    logger.info(f"Loaded {len(grants)} grants from {source}")
     return grants
 
 
 def clean_html(text: str) -> str:
-    """Remove HTML tags"""
+    """Remove HTML tags and normalize whitespace."""
     if not text:
         return ""
     text = re.sub(r'<[^>]+>', ' ', text)
@@ -57,66 +69,47 @@ def clean_html(text: str) -> str:
     return text.strip()
 
 
-def extract_embedding_text(grant: Dict[str, Any]) -> str:
-    """Extract rich text for embedding"""
-    parts = []
-    
-    # Title
-    if grant.get('title'):
-        parts.append(f"Title: {grant['title']}")
-    
-    # Programme
-    parts.append(f"Programme: {grant['source'].replace('_', ' ').title()}")
-    
-    # Status and dates
-    if grant.get('status'):
-        parts.append(f"Status: {grant['status']}")
-    
-    if grant.get('close_date'):
-        parts.append(f"Deadline: {grant['close_date']}")
-    
-    # Call ID
-    if grant.get('call_id'):
-        parts.append(f"Call: {grant['call_id']}")
-    
-    # Extract description from raw
-    raw = grant.get('raw', {})
-    metadata = raw.get('metadata', {})
-    
-    # Description
-    description = None
-    if 'descriptionByte' in metadata:
-        desc_field = metadata['descriptionByte']
-        if isinstance(desc_field, list) and len(desc_field) > 0:
-            description = desc_field[0]
-        elif isinstance(desc_field, str):
-            description = desc_field
-    
-    if description:
-        description = clean_html(description)
-        if len(description) > 4000:
-            description = description[:3500] + "\n...\n" + description[-500:]
-        parts.append(f"\nDescription:\n{description}")
-    
-    # Tags
-    if 'crossCuttingPriorities' in metadata:
-        priorities = metadata['crossCuttingPriorities']
-        if isinstance(priorities, list) and priorities:
-            parts.append(f"\nFocus Areas: {', '.join(priorities)}")
-    
-    return "\n".join(parts)
+def convert_eur_to_gbp(amount_eur: Optional[int]) -> Optional[int]:
+    """Convert EUR to GBP using approximate exchange rate."""
+    return int(amount_eur * EUR_TO_GBP_RATE) if amount_eur else None
 
 
 def extract_tags(grant: Dict[str, Any]) -> List[str]:
-    """Extract tags from raw data"""
+    """Extract tags from raw data."""
     raw = grant.get('raw', {})
     metadata = raw.get('metadata', {})
     priorities = metadata.get('crossCuttingPriorities', [])
     return priorities if isinstance(priorities, list) else []
 
 
+def extract_sectors_from_tags(tags: List[str]) -> List[str]:
+    """Map cross-cutting priorities to sector categories."""
+    sector_mapping = {
+        'climate': ['Climate', 'Environment'],
+        'digital': ['Digital', 'Technology'],
+        'health': ['Health', 'Life Sciences'],
+        'energy': ['Energy', 'Clean Tech'],
+        'transport': ['Transport', 'Mobility'],
+        'food': ['Food', 'Agriculture'],
+        'security': ['Security', 'Defence'],
+        'space': ['Space', 'Aerospace'],
+        'culture': ['Culture', 'Creative Industries'],
+        'social': ['Social Innovation'],
+        'industrial': ['Manufacturing', 'Industry'],
+    }
+
+    sectors = set()
+    for tag in tags:
+        tag_lower = tag.lower()
+        for keyword, sector_list in sector_mapping.items():
+            if keyword in tag_lower:
+                sectors.update(sector_list)
+
+    return list(sectors) if sectors else ['General']
+
+
 def extract_summary(grant: Dict[str, Any]) -> str:
-    """Extract description summary (first 500 chars)"""
+    """Extract description summary (first 500 chars)."""
     raw = grant.get('raw', {})
     metadata = raw.get('metadata', {})
 
@@ -135,8 +128,24 @@ def extract_summary(grant: Dict[str, Any]) -> str:
     return ''
 
 
-def extract_budget(grant: Dict[str, Any]) -> tuple[int, int]:
-    """Extract budget_min and budget_max from raw data"""
+def extract_full_description(grant: Dict[str, Any]) -> str:
+    """Extract full description text."""
+    raw = grant.get('raw', {})
+    metadata = raw.get('metadata', {})
+
+    desc = None
+    if 'descriptionByte' in metadata:
+        desc_field = metadata['descriptionByte']
+        if isinstance(desc_field, list) and len(desc_field) > 0:
+            desc = desc_field[0]
+        elif isinstance(desc_field, str):
+            desc = desc_field
+
+    return clean_html(desc) if desc else ''
+
+
+def extract_budget(grant: Dict[str, Any]) -> tuple[Optional[int], Optional[int]]:
+    """Extract budget_min and budget_max from raw data."""
     raw = grant.get('raw', {})
     metadata = raw.get('metadata', {})
 
@@ -144,8 +153,6 @@ def extract_budget(grant: Dict[str, Any]) -> tuple[int, int]:
     if isinstance(budget, list) and budget:
         try:
             budget_val = int(budget[0])
-            # For now, set both min and max to same value
-            # Future: parse budget ranges if available
             return (budget_val, budget_val)
         except (ValueError, TypeError):
             pass
@@ -153,16 +160,14 @@ def extract_budget(grant: Dict[str, Any]) -> tuple[int, int]:
     return (None, None)
 
 
-def extract_programme_name(grant: Dict[str, Any]) -> str:
-    """Extract programme code from identifier (e.g., 'HORIZON-CL5', 'HORIZON-EIT')"""
+def extract_programme_name(grant: Dict[str, Any]) -> Optional[str]:
+    """Extract programme code from identifier (e.g., 'HORIZON-CL5', 'HORIZON-EIT')."""
     raw = grant.get('raw', {})
     metadata = raw.get('metadata', {})
 
-    # Extract from identifier prefix
     if 'identifier' in metadata:
         ident = metadata['identifier']
         if isinstance(ident, list) and ident:
-            # e.g., "HORIZON-EIT-2023-25-KIC-EITURBANMOBILITY" -> "HORIZON-EIT"
             parts = ident[0].split('-')
             if len(parts) >= 2:
                 return '-'.join(parts[:2])
@@ -170,12 +175,11 @@ def extract_programme_name(grant: Dict[str, Any]) -> str:
     return None
 
 
-def extract_action_type(grant: Dict[str, Any]) -> str:
-    """Extract action type from metadata"""
+def extract_action_type(grant: Dict[str, Any]) -> Optional[str]:
+    """Extract action type from metadata."""
     raw = grant.get('raw', {})
     metadata = raw.get('metadata', {})
 
-    # Check type field
     if 'type' in metadata:
         type_field = metadata['type']
         if isinstance(type_field, list) and type_field:
@@ -184,23 +188,22 @@ def extract_action_type(grant: Dict[str, Any]) -> str:
     return None
 
 
-def extract_duration(grant: Dict[str, Any]) -> str:
-    """Extract project duration"""
+def extract_duration(grant: Dict[str, Any]) -> Optional[str]:
+    """Extract project duration."""
     raw = grant.get('raw', {})
     metadata = raw.get('metadata', {})
 
     if 'duration' in metadata:
         duration = metadata['duration']
         if isinstance(duration, list) and duration:
-            # Clean HTML and limit length
             duration_text = clean_html(duration[0])
             return duration_text[:200] if len(duration_text) > 200 else duration_text
 
     return None
 
 
-def extract_deadline_model(grant: Dict[str, Any]) -> str:
-    """Extract deadline model (single-stage vs multiple cut-off)"""
+def extract_deadline_model(grant: Dict[str, Any]) -> Optional[str]:
+    """Extract deadline model (single-stage vs multiple cut-off)."""
     raw = grant.get('raw', {})
     metadata = raw.get('metadata', {})
 
@@ -212,8 +215,8 @@ def extract_deadline_model(grant: Dict[str, Any]) -> str:
     return None
 
 
-def extract_identifier(grant: Dict[str, Any]) -> str:
-    """Extract official EU identifier"""
+def extract_identifier(grant: Dict[str, Any]) -> Optional[str]:
+    """Extract official EU identifier."""
     raw = grant.get('raw', {})
     metadata = raw.get('metadata', {})
 
@@ -225,8 +228,8 @@ def extract_identifier(grant: Dict[str, Any]) -> str:
     return None
 
 
-def extract_call_title(grant: Dict[str, Any]) -> str:
-    """Extract call title"""
+def extract_call_title(grant: Dict[str, Any]) -> Optional[str]:
+    """Extract call title."""
     raw = grant.get('raw', {})
     metadata = raw.get('metadata', {})
 
@@ -238,30 +241,28 @@ def extract_call_title(grant: Dict[str, Any]) -> str:
     return None
 
 
-def extract_further_info(grant: Dict[str, Any]) -> str:
-    """Extract further information (HTML content)"""
+def extract_further_info(grant: Dict[str, Any]) -> Optional[str]:
+    """Extract further information (HTML content)."""
     raw = grant.get('raw', {})
     metadata = raw.get('metadata', {})
 
     if 'furtherInformation' in metadata:
         info = metadata['furtherInformation']
         if isinstance(info, list) and info:
-            # Clean HTML and limit length
             info_text = clean_html(info[0])
             return info_text[:1000] if len(info_text) > 1000 else info_text
 
     return None
 
 
-def extract_application_info(grant: Dict[str, Any]) -> str:
-    """Extract beneficiary administration/application instructions"""
+def extract_application_info(grant: Dict[str, Any]) -> Optional[str]:
+    """Extract beneficiary administration/application instructions."""
     raw = grant.get('raw', {})
     metadata = raw.get('metadata', {})
 
     if 'beneficiaryAdministration' in metadata:
         info = metadata['beneficiaryAdministration']
         if isinstance(info, list) and info:
-            # Clean HTML and limit length
             info_text = clean_html(info[0])
             return info_text[:1000] if len(info_text) > 1000 else info_text
 
@@ -269,7 +270,7 @@ def extract_application_info(grant: Dict[str, Any]) -> str:
 
 
 def map_status(grant: Dict[str, Any]) -> str:
-    """Convert status ID to readable string"""
+    """Convert status ID to readable string."""
     status_map = {
         '31094501': 'Forthcoming',
         '31094502': 'Open',
@@ -278,16 +279,12 @@ def map_status(grant: Dict[str, Any]) -> str:
 
     status = grant.get('status', '')
 
-    # Status is a string like "['31094502']" - extract the ID
     if isinstance(status, str):
-        # Remove brackets and quotes, extract ID
-        import re
         match = re.search(r"'(\d+)'", status)
         if match:
             status_id = match.group(1)
             return status_map.get(status_id, 'Unknown')
 
-    # Fallback for actual list format (just in case)
     if isinstance(status, list) and len(status) > 0:
         status_id = status[0]
         return status_map.get(status_id, 'Unknown')
@@ -295,187 +292,276 @@ def map_status(grant: Dict[str, Any]) -> str:
     return 'Unknown'
 
 
-def ingest_grant(grant: Dict[str, Any]):
-    """Ingest one grant into both Postgres and Pinecone"""
-    cursor = pg_conn.cursor()
+def extract_embedding_text(grant_doc: Dict[str, Any]) -> str:
+    """Extract rich text for embedding generation."""
+    parts = []
 
+    if grant_doc.get('title'):
+        parts.append(f"Title: {grant_doc['title']}")
+
+    if grant_doc.get('source'):
+        parts.append(f"Programme: {grant_doc['source'].replace('_', ' ').title()}")
+
+    if grant_doc.get('status'):
+        parts.append(f"Status: {grant_doc['status']}")
+
+    if grant_doc.get('closes_at'):
+        parts.append(f"Deadline: {grant_doc['closes_at']}")
+
+    if grant_doc.get('programme'):
+        parts.append(f"Programme Code: {grant_doc['programme']}")
+
+    if grant_doc.get('action_type'):
+        parts.append(f"Action Type: {grant_doc['action_type']}")
+
+    description = grant_doc.get('description', '')
+    if description:
+        if len(description) > 4000:
+            description = description[:3500] + "\n...\n" + description[-500:]
+        parts.append(f"\nDescription:\n{description}")
+
+    tags = grant_doc.get('tags', [])
+    if tags:
+        parts.append(f"\nFocus Areas: {', '.join(tags[:10])}")
+
+    return "\n".join(parts)
+
+
+def normalize_eu_grant(grant: Dict[str, Any], source: str) -> Dict[str, Any]:
+    """
+    Normalize a raw EU grant to the MongoDB document schema.
+
+    Args:
+        grant: Raw grant data from scraper
+        source: "horizon_europe" or "digital_europe"
+
+    Returns:
+        Normalized MongoDB document
+    """
+    # Validate and fix dates
+    open_date = grant.get('open_date')
+    close_date = grant.get('close_date')
+
+    if open_date and close_date:
+        try:
+            open_dt = datetime.fromisoformat(open_date.replace('Z', '+00:00'))
+            close_dt = datetime.fromisoformat(close_date.replace('Z', '+00:00'))
+            if close_dt < open_dt:
+                logger.warning(f"Fixing swapped dates for {grant['id']}")
+                open_date, close_date = close_date, open_date
+        except (ValueError, TypeError):
+            pass
+
+    # Extract fields
+    budget_min, budget_max = extract_budget(grant)
+    tags = extract_tags(grant)
+    status = map_status(grant)
+    eu_identifier = extract_identifier(grant)
+
+    # Build document following the spec schema
+    grant_doc = {
+        "grant_id": f"{source}_{grant['id']}",
+        "source": source,
+        "external_id": eu_identifier or grant['id'],
+
+        # Core metadata
+        "title": grant['title'],
+        "call_title": extract_call_title(grant),
+        "url": grant['url'],
+        "description": extract_full_description(grant),
+        "description_summary": extract_summary(grant),
+
+        # Status & dates
+        "status": status,
+        "is_active": status == "Open",
+        "opens_at": open_date,
+        "closes_at": close_date,
+        "deadline_model": extract_deadline_model(grant),
+
+        # Funding (EUR values, with GBP conversion)
+        "total_fund_gbp": convert_eur_to_gbp(budget_max),
+        "total_fund_eur": budget_max,
+        "budget_min": budget_min,
+        "budget_max": budget_max,
+        "project_funding_min": budget_min,
+        "project_funding_max": budget_max,
+        "competition_type": "grant",
+
+        # Programme info
+        "programme": extract_programme_name(grant),
+        "action_type": extract_action_type(grant),
+        "duration": extract_duration(grant),
+
+        # Classification
+        "tags": tags,
+        "sectors": extract_sectors_from_tags(tags),
+
+        # Additional EU-specific fields
+        "further_information": extract_further_info(grant),
+        "application_info": extract_application_info(grant),
+
+        # Timestamps
+        "scraped_at": datetime.now(timezone.utc),
+        "updated_at": datetime.now(timezone.utc),
+    }
+
+    return grant_doc
+
+
+def ingest_grant(grant: Dict[str, Any], source: str) -> bool:
+    """
+    Ingest one grant into MongoDB and Pinecone.
+
+    Args:
+        grant: Raw grant from scraper
+        source: "horizon_europe" or "digital_europe"
+
+    Returns:
+        True if successful, False otherwise
+    """
     try:
-        # Validate and fix dates
-        open_date = grant.get('open_date')
-        close_date = grant.get('close_date')
+        # Normalize to MongoDB document
+        grant_doc = normalize_eu_grant(grant, source)
 
-        # Fix invalid dates (close before open)
-        if open_date and close_date:
-            try:
-                from datetime import datetime
-                open_dt = datetime.fromisoformat(open_date)
-                close_dt = datetime.fromisoformat(close_date)
+        # Upsert to MongoDB
+        result = db.grants.update_one(
+            {"grant_id": grant_doc["grant_id"]},
+            {
+                "$set": grant_doc,
+                "$setOnInsert": {"created_at": datetime.now(timezone.utc)}
+            },
+            upsert=True
+        )
 
-                if close_dt < open_dt:
-                    # Swap them - probably scraped wrong
-                    print(f"⚠️  Fixing swapped dates for {grant['id']}")
-                    open_date, close_date = close_date, open_date
-            except:
-                pass  # Invalid date format, keep as is
-
-        # Extract additional fields
-        budget_min, budget_max = extract_budget(grant)
-        programme = extract_programme_name(grant)
-        action_type = extract_action_type(grant)
-        duration = extract_duration(grant)
-        deadline_model = extract_deadline_model(grant)
-        eu_identifier = extract_identifier(grant)
-        call_title = extract_call_title(grant)
-        further_info = extract_further_info(grant)
-        app_info = extract_application_info(grant)
-        status = map_status(grant)  # Convert status ID to readable string
-
-        # 1. Insert into PostgreSQL
-        cursor.execute("""
-            INSERT INTO grants (
-                grant_id, source, title, url, call_id,
-                status, open_date, close_date, programme,
-                tags, description_summary, budget_min, budget_max,
-                action_type, duration, deadline_model, eu_identifier,
-                call_title, further_information, application_info,
-                scraped_at
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
-            ON CONFLICT (grant_id) DO UPDATE SET
-                status = EXCLUDED.status,
-                close_date = EXCLUDED.close_date,
-                budget_min = EXCLUDED.budget_min,
-                budget_max = EXCLUDED.budget_max,
-                action_type = EXCLUDED.action_type,
-                duration = EXCLUDED.duration,
-                deadline_model = EXCLUDED.deadline_model,
-                eu_identifier = EXCLUDED.eu_identifier,
-                call_title = EXCLUDED.call_title,
-                further_information = EXCLUDED.further_information,
-                application_info = EXCLUDED.application_info,
-                updated_at = NOW()
-        """, (
-            grant['id'],
-            grant['source'],
-            grant['title'],
-            grant['url'],
-            grant.get('call_id'),
-            status,  # Mapped status (Open/Closed/Forthcoming)
-            open_date,  # Fixed date
-            close_date,  # Fixed date
-            programme,  # Extracted from metadata
-            extract_tags(grant),
-            extract_summary(grant),
-            budget_min,  # Extracted from metadata
-            budget_max,  # Extracted from metadata
-            action_type,  # Extracted from metadata
-            duration,  # Extracted from metadata
-            deadline_model,  # Extracted from metadata
-            eu_identifier,  # Extracted from metadata
-            call_title,  # Extracted from metadata
-            further_info,  # Extracted from metadata
-            app_info,  # Extracted from metadata
-        ))
-
-        # Commit IMMEDIATELY after each insert (not batch mode)
-        pg_conn.commit()
-
-        # 2. Generate embedding
-        text = extract_embedding_text(grant)
+        # Generate embedding
+        embedding_text = extract_embedding_text(grant_doc)
         response = openai.embeddings.create(
-            input=text,
+            input=embedding_text,
             model="text-embedding-3-small"
         )
         embedding = response.data[0].embedding
 
-        # 3. Upsert to Pinecone
-        # Note: Pinecone metadata values must be strings, numbers, or booleans (not None)
+        # Upsert to Pinecone with metadata
         index.upsert(vectors=[{
-            'id': grant['id'],
+            'id': grant_doc["grant_id"],
             'values': embedding,
             'metadata': {
-                'source': grant['source'],
-                'title': grant['title'][:500] if grant.get('title') else '',
-                'status': status,  # Mapped status (Open/Closed/Forthcoming)
-                'close_date': close_date or '',  # Fixed date
-                'programme': programme[:200] if programme else '',
-                'url': grant['url'],
-                'tags': ','.join(extract_tags(grant)[:5]),  # First 5 tags
-                'budget_min': str(budget_min) if budget_min else '',
-                'budget_max': str(budget_max) if budget_max else '',
-                'action_type': action_type or '',
-                'duration': duration[:100] if duration else '',
-                'deadline_model': deadline_model or '',
-                'eu_identifier': eu_identifier or '',
-                'call_title': call_title[:300] if call_title else ''
+                'source': source,
+                'title': grant_doc["title"][:500] if grant_doc.get("title") else '',
+                'programme': (grant_doc.get("programme") or "")[:100],
+                'status': grant_doc["status"],
+                'url': grant_doc["url"],
+                'budget_min': str(grant_doc.get("budget_min") or ""),
+                'budget_max': str(grant_doc.get("budget_max") or ""),
+                'closes_at': grant_doc.get("closes_at") or "",
+                'is_active': grant_doc["is_active"],
+                'action_type': grant_doc.get("action_type") or "",
+                'tags': ','.join(grant_doc.get("tags", [])[:5]),
             }
         }])
 
-        cursor.close()
         return True
 
     except Exception as e:
-        print(f"❌ Error ingesting {grant.get('id')}: {e}")
-        pg_conn.rollback()  # Rollback THIS transaction
-        cursor.close()
+        logger.error(f"Failed to ingest {grant.get('id')}: {e}")
         return False
 
 
-def ingest_source(source: str):
-    """Ingest all grants from a source"""
-    print(f"\n{'='*60}")
-    print(f"Ingesting: {source}")
-    print(f"{'='*60}")
+def ingest_source(source: str) -> Dict[str, int]:
+    """
+    Ingest all grants from a source.
+
+    Args:
+        source: "horizon_europe" or "digital_europe"
+
+    Returns:
+        Dictionary with success and failure counts
+    """
+    logger.info(f"{'='*60}")
+    logger.info(f"Ingesting: {source}")
+    logger.info(f"{'='*60}")
 
     grants = load_grants(source)
     if not grants:
-        return
+        return {'success': 0, 'failed': 0}
 
     success_count = 0
     fail_count = 0
 
     for grant in tqdm(grants, desc=f"Processing {source}"):
-        if ingest_grant(grant):
+        # Add source to grant for processing
+        grant['source'] = source
+
+        if ingest_grant(grant, source):
             success_count += 1
         else:
             fail_count += 1
 
-    # No need to commit here anymore - each grant commits individually
+    logger.info(f"{source} complete: Success={success_count}, Failed={fail_count}")
 
-    print(f"\n✅ {source} complete:")
-    print(f"   Success: {success_count}")
-    print(f"   Failed: {fail_count}")
+    return {'success': success_count, 'failed': fail_count}
+
+
+def get_stats() -> Dict[str, Any]:
+    """Get current database statistics."""
+    stats = {
+        'mongodb': {
+            'total': db.grants.count_documents({}),
+            'horizon_europe': db.grants.count_documents({'source': 'horizon_europe'}),
+            'digital_europe': db.grants.count_documents({'source': 'digital_europe'}),
+            'by_status': {}
+        },
+        'pinecone': {}
+    }
+
+    # Status breakdown
+    for status in ['Open', 'Closed', 'Forthcoming']:
+        stats['mongodb']['by_status'][status] = db.grants.count_documents({'status': status})
+
+    # Pinecone stats
+    try:
+        pinecone_stats = index.describe_index_stats()
+        stats['pinecone']['total_vectors'] = pinecone_stats.get('total_vector_count', 0)
+    except Exception as e:
+        logger.warning(f"Could not get Pinecone stats: {e}")
+        stats['pinecone']['total_vectors'] = 'unavailable'
+
+    return stats
 
 
 def main():
-    print("="*60)
-    print("INGESTING EU GRANTS TO PRODUCTION")
-    print("="*60)
-    
+    """Main ingestion entry point."""
+    logger.info("="*60)
+    logger.info("INGESTING EU GRANTS TO PRODUCTION (MongoDB + Pinecone)")
+    logger.info("="*60)
+
     start_time = datetime.now()
-    
+
     # Ingest both sources
-    ingest_source("horizon_europe")
-    ingest_source("digital_europe")
-    
+    horizon_results = ingest_source("horizon_europe")
+    digital_results = ingest_source("digital_europe")
+
     # Get final stats
-    cursor = pg_conn.cursor()
-    cursor.execute("SELECT COUNT(*) FROM grants")
-    postgres_count = cursor.fetchone()[0]
-    cursor.close()
-    
-    pinecone_stats = index.describe_index_stats()
-    pinecone_count = pinecone_stats['total_vector_count']
-    
+    stats = get_stats()
+
     duration = (datetime.now() - start_time).total_seconds()
-    
-    print(f"\n{'='*60}")
-    print("INGESTION COMPLETE")
-    print(f"{'='*60}")
-    print(f"Duration: {duration:.1f}s")
-    print(f"PostgreSQL grants: {postgres_count}")
-    print(f"Pinecone vectors: {pinecone_count}")
-    
-    pg_conn.close()
+
+    logger.info(f"\n{'='*60}")
+    logger.info("INGESTION COMPLETE")
+    logger.info(f"{'='*60}")
+    logger.info(f"Duration: {duration:.1f}s")
+    logger.info(f"Horizon Europe: {horizon_results['success']} success, {horizon_results['failed']} failed")
+    logger.info(f"Digital Europe: {digital_results['success']} success, {digital_results['failed']} failed")
+    logger.info(f"MongoDB total grants: {stats['mongodb']['total']}")
+    logger.info(f"  - Horizon Europe: {stats['mongodb']['horizon_europe']}")
+    logger.info(f"  - Digital Europe: {stats['mongodb']['digital_europe']}")
+    logger.info(f"  - Open: {stats['mongodb']['by_status'].get('Open', 0)}")
+    logger.info(f"  - Closed: {stats['mongodb']['by_status'].get('Closed', 0)}")
+    logger.info(f"  - Forthcoming: {stats['mongodb']['by_status'].get('Forthcoming', 0)}")
+    logger.info(f"Pinecone vectors: {stats['pinecone']['total_vectors']}")
+
+    # Close MongoDB connection
+    mongo_client.close()
 
 
 if __name__ == "__main__":
